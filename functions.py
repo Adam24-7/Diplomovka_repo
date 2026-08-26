@@ -7,7 +7,7 @@ from sklearn.metrics import root_mean_squared_error, mean_absolute_percentage_er
 import pmdarima
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 import statsmodels.api as sm
-from dateutil.easter import easter
+from xgboost import XGBRegressor
 
 def adf_test(df, alpha=0.05):
     """
@@ -168,132 +168,65 @@ def forward_selection(dataset, notinc):
     return selected_cols
 
 
-def sk_fixed_holidays(year): #check what in 2025 that some holidays were removed
-    fixed = [
-        (1, 1), (1, 6), (5, 1), (5, 8), (7, 5),
-        (8, 29), (9, 1), (9, 15), (11, 1), (11, 17),
-        (12, 24), (12, 25), (12, 26),
-    ]
-    return {pd.Timestamp(year=year, month=m, day=d).date() for m, d in fixed}
 
+def make_features(data, target, exog_cols, n_lags=1):
+    feat = pd.DataFrame(index=data.index)
+    for lag in range(1, n_lags + 1):
+        feat[f"{target}_lag{lag}"] = data[target].shift(lag)
+    for col in exog_cols:
+        feat[f"{col}_lag1"] = data[col].shift(1)
+        feat[col] = data[col]  
+    feat["month"] = data.index.month
+    feat["quarter"] = data.index.quarter
+    feat["trend"] = np.arange(len(data))
+    feat[target] = data[target]
+    return feat.dropna()
 
-
-'''
-def calendar_adjust(
-    df: pd.DataFrame,
-    output_csv: str = "ip_calendar_adjusted.csv",
-    value_col: str = "value",
-    date_col: str = "date",
-    add_trend: bool = True,
-    log_transform: bool = True,
-    print_summary: bool = True,
-) -> tuple[pd.DataFrame, sm.regression.linear_model.RegressionResultsWrapper]:
+def rolling_forecast_xgb(X, y, initial_train_size, horizon=1, refit_every=1, objective = "reg:squarederror",
+                          xgb_params=None):
     """
-    Loads monthly time series, constructs calendar regressors for Slovakia,
-    estimates the calendar component using OLS, and returns the 
-    calendar-adjusted series.
-
-    Parameters
-    ----------
-    df            : input DataFrame
-    output_csv    : path to the output CSV file (None = do not save)
-    value_col     : name of the column containing the values
-    date_col      : name of the column containing the dates
-    add_trend     : whether to include a linear trend in the regression
-    log_transform : True for level series (positive values), 
-                    False for percentage changes or series with negative values
-    print_summary : whether to print the OLS regression summary
-
-    Returns
-    -------
-    (df_out, model) – adjusted DataFrame and the fitted OLS model
+    Walk-forward validacia: model sa periodicky prerefituje (refit_every mesiacov)
+    a generuje jednokrokove (h=1) predikcie, rovnako ako pri rolling ARIMAX evaluacii.
     """
-    # 1) Príprava
-    df = df.copy()
-    if df.index.name == date_col:
-        df = df.reset_index()
-    df[date_col] = pd.to_datetime(df[date_col]).dt.to_period("M")
-    df = df.sort_values(date_col).reset_index(drop=True)
-
-    # 2) Kalendárne regresory
-    rows = []
-    for p in df[date_col]:
-        start = p.to_timestamp(how="start")
-        end = p.to_timestamp(how="end").normalize()
-        days = pd.date_range(start, end, freq="D")
-
-        fixed_h = sk_fixed_holidays(start.year)
-
-        working_days = sum(
-            (d.weekday() < 5) and (d.date() not in fixed_h)
-            for d in days
+    if xgb_params is None:
+        xgb_params = dict(
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
         )
 
-        e = pd.Timestamp(easter(start.year))
-        good_friday = (e - pd.Timedelta(days=2)).date()
-        easter_monday = (e + pd.Timedelta(days=1)).date()
+    preds, actuals, dates = [], [], []
+    n = len(y)
+    model = None
 
-        easter_nonworkdays = sum([
-            int(start.month == good_friday.month),
-            int(start.month == easter_monday.month),
-        ])
+    for t in range(initial_train_size, n):
+        if model is None or (t - initial_train_size) % refit_every == 0:
+            model = XGBRegressor(**xgb_params)
+            model.fit(X.iloc[:t], y.iloc[:t])
 
-        leap_feb = int((start.month == 2) and start.is_leap_year)
+        X_step = X.iloc[[t]]
+        y_hat = model.predict(X_step)[0]
 
-        rows.append({
-            date_col: p,
-            "working_days": working_days,
-            "easter_nonworkdays": easter_nonworkdays,
-            "leap_feb": leap_feb,
-        })
+        preds.append(y_hat)
+        actuals.append(y.iloc[t])
+        dates.append(y.index[t])
 
-    X = pd.DataFrame(rows)
+    result = pd.DataFrame({"actual": actuals, "predicted": preds}, index=dates)
+    return result, model
 
-    # 3) Centrovanie
-    cal_cols = ["working_days", "easter_nonworkdays", "leap_feb"]
-    for c in cal_cols:
-        X[c] = X[c] - X[c].mean()
+def extract_tree_structure(model, output_csv="xgb_trees_structure.csv"):
+    """
+    Vrati DataFrame s kompletnou strukturou VSETKYCH stromov v ansambli.
+    Kazdy riadok = jeden uzol (vnutorny alebo listovy) v jednom strome.
+    """
+    trees_df = model.get_booster().trees_to_dataframe()
+    trees_df.to_csv(output_csv, index=False)
+    return trees_df
 
-    if add_trend:
-        X["trend"] = np.arange(len(X))
-
-    X = sm.add_constant(X)
-
-    # 4) OLS — s logom alebo bez
-    y = np.log(df[value_col].astype(float)) if log_transform else df[value_col].astype(float)
-    model = sm.OLS(y, X.drop(columns=[date_col])).fit() # type: ignore[reportAttributeAccessIssue]
-
-    if print_summary:
-        print(model.summary())
-
-    # 5) Kalendárna korekcia
-    calendar_part = (
-        model.params["working_days"] * X["working_days"].values # type: ignore[reportAttributeAccessIssue]
-        + model.params["easter_nonworkdays"] * X["easter_nonworkdays"].values # type: ignore[reportAttributeAccessIssue]
-        + model.params["leap_feb"] * X["leap_feb"].values # type: ignore[reportAttributeAccessIssue]
-    )
-
-    if log_transform:
-        df["value_ca"] = np.exp(y.values - calendar_part) # type: ignore[reportAttributeAccessIssue]
-    else:
-        df["value_ca"] = y.values - calendar_part # type: ignore[reportAttributeAccessIssue]
-
-    df["mom_ca_pct"] = 100 * (df["value_ca"] / df["value_ca"].shift(1) - 1)
-    df["yoy_ca_pct"] = 100 * (df["value_ca"] / df["value_ca"].shift(12) - 1)
-
-    # 6) Výstup
-    for c in cal_cols:
-        df[c] = X[c].values # type: ignore[reportAttributeAccessIssue]
-
-    out = df.copy()
-
-    if output_csv:
-        out[date_col] = out[date_col].astype(str)
-        out.to_csv(output_csv, index=False)
-        out[date_col] = pd.to_datetime(out[date_col])
-
-    out = out.set_index(date_col)
-
-    return out, model
-
-    '''
+def trace_path_for_observation(trees_df, tree_index):
+    """Vypise vsetky uzly a podmienky pre dany strom (0 = koren)."""
+    path = trees_df[(trees_df["Tree"] == tree_index)]
+    return path[["Node", "Feature", "Split", "Yes", "No", "Gain", "Cover"]]
