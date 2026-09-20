@@ -5,3 +5,5 @@ __pycache__/arimax_functions.cpython-314.pyc
 __pycache__/xgboost_functions.cpython-314.pyc
 cred.py
 __pycache__/cred.cpython-314.pyc
+__pycache__/functions_elastic_net.cpython-314.pyc
+__pycache__/functions_general.cpython-314.pyc
