@@ -7,3 +7,5 @@ cred.py
 __pycache__/cred.cpython-314.pyc
 __pycache__/functions_elastic_net.cpython-314.pyc
 __pycache__/functions_general.cpython-314.pyc
+__pycache__/functions_elastic_net.cpython-314.pyc
+__pycache__/functions_xgboost.cpython-314.pyc

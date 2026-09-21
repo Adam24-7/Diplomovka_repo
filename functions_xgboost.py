@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 from xgboost import XGBRegressor
 from typing import cast
+from sklearn.model_selection import RandomizedSearchCV, GridSearchCV, TimeSeriesSplit
+
 
 def make_features(data, target, exog_cols, target_lags=(1, 2, 3, 6, 12), exog_lags=(1,)):
     feat = pd.DataFrame(index=data.index)
@@ -23,6 +25,68 @@ def make_features(data, target, exog_cols, target_lags=(1, 2, 3, 6, 12), exog_la
 
     return feat.dropna()
 
+def hyperparameters_tuning(X_train, y_train, random_state = 24, n_splits = 5):
+
+        #tuning hyperparametrov
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    #random_search
+    random_param_space = {
+        "n_estimators": [100, 200, 300, 400, 600],
+        "max_depth": [1, 2, 3, 4, 5, 6],
+        "learning_rate": [0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.1, 0.2],
+        "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
+        "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
+        "min_child_weight": [1, 3, 5, 7],
+        "reg_alpha": [0, 0.01, 0.1, 1],
+        "reg_lambda": [0.5, 1, 1.5, 2],
+        "gamma": [0, 0.1, 0.5, 1, 5],
+    }
+
+    random_search = RandomizedSearchCV(
+        estimator=XGBRegressor(random_state=random_state),
+        param_distributions=random_param_space,
+        n_iter=60,
+        scoring="neg_root_mean_squared_error",
+        cv=tscv,
+        random_state=random_state,
+        n_jobs=-1,
+        verbose=1,
+    )
+
+    random_search.fit(X_train, y_train)
+    print("Najlepsie parametre z Random Search:", random_search.best_params_)
+
+    best = random_search.best_params_
+
+    #grid_search
+    grid_param_space = {
+        "n_estimators": sorted(set([max(50, best["n_estimators"] - 100), best["n_estimators"], best["n_estimators"] + 100])),
+        "max_depth": sorted(set([max(1, best["max_depth"] - 1), best["max_depth"], best["max_depth"] + 1])),
+        "learning_rate": sorted(set([round(best["learning_rate"] * 0.5, 4), best["learning_rate"], round(best["learning_rate"] * 1.5, 4)])),
+        "gamma": sorted(set([max(0, best["gamma"] - 1), best["gamma"], best["gamma"] + 1])),
+        "subsample": [best["subsample"]],
+        "colsample_bytree": [best["colsample_bytree"]],
+        "min_child_weight": [best["min_child_weight"]],
+        "reg_alpha": [best["reg_alpha"]],
+        "reg_lambda": [best["reg_lambda"]],
+    }
+
+    grid_search = GridSearchCV(
+        estimator=XGBRegressor(random_state=random_state),
+        param_grid=grid_param_space,
+        scoring="neg_root_mean_squared_error",
+        cv=tscv,
+        n_jobs=-1,
+        verbose=1,
+    )
+
+    grid_search.fit(X_train, y_train)
+    best_params = grid_search.best_params_
+    print("Finalne parametre po Grid Search:", best_params)
+
+    return grid_search, best_params
+
 
 def rolling_forecast_xgb(
     X: pd.DataFrame,
@@ -36,40 +100,6 @@ def rolling_forecast_xgb(
     xgb_params: dict | None = None,
     reconstruction: str = "onestep",
 ) -> tuple[pd.DataFrame, dict]:
-    """
-    Rolling one-step XGBoost forecast s rekonstrukciou na povodnu uroven.
-
-    Parameters
-    ----------
-    X : pd.DataFrame
-        Feature matica zarovnana s y_diff.
-    y_diff : pd.Series
-        Cielova premenna, ktoru XGBoost predikuje - typicky prva diferencia.
-    level_series : pd.Series
-        Povodna nediferencovana uroven, napr. df_pp["pp_sa"].
-    initial_train_size : int
-        Pocet pozorovani dostupnych pred prvym testovacim bodom.
-    last_train_value : float
-        Posledna znama uroven pred prvym testovacim bodom.
-    horizon : int
-        Aktualna implementacia je urcena pre horizon=1.
-    refit_every : int
-        Refit pri kazdom n-tom testovacom kroku.
-    objective : str
-        XGBoost objective funkcia.
-    xgb_params : dict
-        Hyperparametre XGBRegressor.
-    reconstruction : str
-        "onestep" pouzije skutocny predchadzajuci level.
-        "cumulative" pouzije predikovany predchadzajuci level.
-
-    Returns
-    -------
-    results : pd.DataFrame
-        Vysledky po jednotlivych testovacich mesiacoch.
-    models_by_step : dict
-        Model pouzity v jednotlivych refit krokoch.
-    """
 
     if horizon != 1:
         raise ValueError("Tato funkcia podporuje iba horizon=1.")
@@ -91,21 +121,16 @@ def rolling_forecast_xgb(
 
     xgb_params["objective"] = objective
 
-    # ------------------------------------------------------------------
-    # Kontroly vstupov
-    # ------------------------------------------------------------------
+    
     if not isinstance(y_diff, pd.Series):
         raise TypeError("y_diff musi byt pandas Series.")
 
-    # fix: bez unikatneho indexu na y_diff/X by mohlo dojst k tichemu
-    # prepisaniu zaznamov v models_by_step (kluc = current_date).
     if not y_diff.index.is_unique:
         raise ValueError(
             "y_diff obsahuje duplicitne datumy v indexe. "
             "Kazdy datum musi mat prave jednu hodnotu."
         )
 
-    # Dovoli aj DataFrame s presne jednym stlpcom, interne ho premeni na Series.
     if isinstance(level_series, pd.DataFrame):
         if level_series.shape[1] != 1:
             raise ValueError(
@@ -147,9 +172,7 @@ def rolling_forecast_xgb(
             f"Chybajuce datumy: {missing_dates.tolist()}"
         )
 
-    # ------------------------------------------------------------------
-    # Rolling one-step cyklus
-    # ------------------------------------------------------------------
+    
     records = []
     models_by_step: dict = {}
     model = None
@@ -273,7 +296,7 @@ def rolling_forecast_xgb(
 
     print(f"RMSE (diferencia): {rmse_diff:.4f}")
     print(f"RMSE (level, {reconstruction} rekonstrukcia): {rmse_level:.4f}")
-    print(f"MAPE (level, WMAPE = sum|chyba| / sum|skutocnost|): {mape_level:.2f}%")
+    print(f"MAPE (level, WMAPE): {mape_level:.2f}%")
     print(f"ME (level): {me_level:.4f}")
 
     if reconstruction == "onestep" and misaligned_dates:

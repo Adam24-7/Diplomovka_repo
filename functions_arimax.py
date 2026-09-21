@@ -12,47 +12,7 @@ def evaluate_forecast_rolling(data_diff, exog, initial_train_size, order,
                                seasonal=False, m=12,
                                enforce_stationarity=True,
                                maxiter=50, method="lbfgs"):
-    """
-    Rolling (walk-forward) vyhodnotenie ARIMAX modelu - metodicky konzistentne
-    s rolling_forecast_xgb() pre XGBoost.
 
-    Namiesto jednorazoveho natrenovania a 24-krokovej predikcie naraz sa model
-    v kazdom mesiaci natrénuje znovu na vsetkych dostupnych datach do vtedy
-    a predikuje len 1 mesiac dopredu. Chyba sa neakumuluje, lebo kazdy krok
-    vyuziva SKUTOCNE predchadzajuce hodnoty (nie predikovane).
-
-    Parametre
-    ----------
-    data_diff : pd.Series
-        Cielova premenna na diferencii (napr. pp_sa.diff()).
-    exog : pd.DataFrame
-        Exogenne premenné zarovnané s data_diff.
-    initial_train_size : int
-        Pocet pozorovani v pociatocnej trenovacej mnozine (pred zaciatkom testu).
-    order : tuple
-        (p,d,q) alebo (p,d,q)(P,D,Q,m) pre sezonny ARIMAX.
-    last_train_value : float
-        Posledna znama urovnova hodnota tesne PRED prvym testovacim bodom.
-    level_series : pd.Series
-        Povodny (nediferencovany) rad pp_sa, so stejnym datumovym indexom
-        ako data_diff (dlhsi o 1 pozorovanie na zaciatku).
-    seasonal : bool
-        Ci ide o sezonny model SARIMAX (True) alebo obycajny ARIMAX (False).
-    m : int
-        Sezonny period (12 pre mesacné´´ data).
-    enforce_stationarity : bool
-        Obmedzenie na stacionaritu (odporucane pre mensie datasety).
-    maxiter : int
-        Maximalny pocet iteracii optimalizacie.
-    method : str
-        Optimalizacná´´ metoda (napr. "lbfgs", "bfgs").
-
-    Vracia
-    -------
-    results : pd.DataFrame
-        Indexované´´ datumom, obsahuje skutocné´´ a predikované´´ hodnoty
-        na diferenciach aj urovniach, plus chybové´´ metriky.
-    """
     records = []
     models_by_step = {}
 
