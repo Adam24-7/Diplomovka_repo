@@ -60,6 +60,9 @@ def evaluate_forecast_rolling(data_diff, exog, initial_train_size, order,
 
     results = pd.DataFrame(records).set_index("date")
 
+    # Rolling a window metriky
+
+    
     # Agregovane metriky
     rmse_diff = np.sqrt(results["sq_error_diff"].mean())
     rmse_level = np.sqrt(results["sq_error_level"].mean())

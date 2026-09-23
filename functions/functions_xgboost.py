@@ -6,6 +6,63 @@ from xgboost import XGBRegressor
 from typing import cast
 from sklearn.model_selection import RandomizedSearchCV, GridSearchCV, TimeSeriesSplit
 
+import functions_general as fg
+
+
+
+def _extract_xgboost_diagnostics(refit_diagnostics, step_diagnostics):
+    importance_rows, hyperparam_rows = [], []
+    for rec in refit_diagnostics:
+        d = rec["forecast_date"]
+        for itype in ("gain", "weight", "cover"):
+            for feat, val in rec.get(f"importance_{itype}", {}).items():
+                importance_rows.append({"forecast_date": d, "feature": feat,
+                                         "importance_type": itype, "value": float(val)})
+        hyperparam_rows.append({"forecast_date": d, **rec.get("params", {})})
+    return {
+        "feature_importance": pd.DataFrame(importance_rows),
+        "hyperparams": pd.DataFrame(hyperparam_rows).set_index("forecast_date")
+                        if hyperparam_rows else pd.DataFrame(),
+    }
+
+def _make_xgboost_fit_fn(xgb_params, param_grid=None, cv_splits=5):
+
+    def _fit(X_train, y_train, current_date):
+        if param_grid:
+            n_splits = min(cv_splits, max(len(X_train) // 10, 2))
+            gs = GridSearchCV(XGBRegressor(**xgb_params), param_grid,
+                               cv=TimeSeriesSplit(n_splits=n_splits),
+                               scoring="neg_mean_squared_error", n_jobs=-1)
+            gs.fit(X_train, y_train)
+            model, used_params = gs.best_estimator_, {**xgb_params, **gs.best_params_}
+        else:
+            model = XGBRegressor(**xgb_params)
+            model.fit(X_train, y_train)
+            used_params = dict(xgb_params)
+
+        b = model.get_booster()
+        diag = {"importance_gain": b.get_score(importance_type="gain"),
+                "importance_weight": b.get_score(importance_type="weight"),
+                "importance_cover": b.get_score(importance_type="cover"),
+                "params": used_params}
+        return model, diag
+    return _fit
+
+def _xgboost_predict_fn(model, X_row, current_date):
+    return float(np.asarray(model.predict(X_row)).ravel()[0]), {}
+
+def rolling_forecast_xgboost(X, y_diff, level_series, initial_train_size,
+                              refit_every=1, xgb_params=None, param_grid=None,
+                              cv_splits=5, objective="reg:squarederror", verbose=True):
+    default_params = {"n_estimators": 300, "max_depth": 3, "learning_rate": 0.05,
+                       "subsample": 0.8, "colsample_bytree": 0.8, "random_state": 42}
+    xgb_params = {**default_params, **(xgb_params or {}), "objective": objective}
+    fit_fn = _make_xgboost_fit_fn(xgb_params, param_grid, cv_splits)
+
+    out = fg._rolling_forecast_core(X, y_diff, level_series, initial_train_size,
+                                  fit_fn, _xgboost_predict_fn, refit_every, verbose=verbose)
+    out["diagnostics"] = _extract_xgboost_diagnostics(out["refit_diagnostics"], out["step_diagnostics"])
+    return out
 
 def make_features(data, target, exog_cols, target_lags=(1, 2, 3, 6, 12), exog_lags=(1,)):
     feat = pd.DataFrame(index=data.index)
@@ -98,7 +155,6 @@ def rolling_forecast_xgb(
     refit_every: int = 1,
     objective: str = "reg:squarederror",
     xgb_params: dict | None = None,
-    reconstruction: str = "onestep",
 ) -> tuple[pd.DataFrame, dict]:
 
     if horizon != 1:
@@ -114,7 +170,6 @@ def rolling_forecast_xgb(
             "random_state": 42,
         }
     elif not isinstance(xgb_params, dict):
-        # fix: jasna chyba namiesto neskoreho a mätúceho AttributeError pri .copy()
         raise TypeError("xgb_params musi byt dict alebo None.")
     else:
         xgb_params = xgb_params.copy()
@@ -164,7 +219,6 @@ def rolling_forecast_xgb(
     if refit_every < 1:
         raise ValueError("refit_every musi byt aspon 1.")
 
-    # Dolezita kontrola: levelovy rad musi obsahovat vsetky datumy modelovaneho radu.
     missing_dates = y_diff.index.difference(level_series.index)
     if len(missing_dates) > 0:
         raise ValueError(
@@ -178,8 +232,7 @@ def rolling_forecast_xgb(
     model = None
     previous_predicted_level = float(last_train_value)
     refit_date = None
-    misaligned_dates: list = []  # fix: diagnostika nesuladu y_diff <-> level_series
-
+    misaligned_dates: list = []  
 
     y_diff_values = y_diff.to_numpy(dtype=float)
     level_values = level_series.to_numpy(dtype=float)
@@ -204,29 +257,19 @@ def rolling_forecast_xgb(
 
         actual_level = float(level_values[current_position])
 
-        if reconstruction == "onestep":
-            if current_position == 0:
-                raise ValueError(
-                    f"Pre datum {current_date} neexistuje predchadzajuca "
-                    "levelova hodnota potrebna pre one-step rekonstrukciu."
-                )
-
-            previous_level = float(level_values[current_position - 1])
-            predicted_level = float(previous_level + pred_diff)
-
-
-            implied_diff = actual_level - previous_level
-            if not np.isclose(implied_diff, actual_diff, rtol=1e-4, atol=1e-8):
-                misaligned_dates.append((current_date, implied_diff, actual_diff))
-
-        elif reconstruction == "cumulative":
-            predicted_level = float(previous_predicted_level + pred_diff)
-            previous_predicted_level = predicted_level
-
-        else:
+        if current_position == 0:
             raise ValueError(
-                "reconstruction musi byt 'onestep' alebo 'cumulative'."
+                f"Pre datum {current_date} neexistuje predchadzajuca "
+                "levelova hodnota potrebna pre one-step rekonstrukciu."
             )
+
+        previous_level = float(level_values[current_position - 1])
+        predicted_level = float(previous_level + pred_diff)
+
+
+        implied_diff = actual_level - previous_level
+        if not np.isclose(implied_diff, actual_diff, rtol=1e-4, atol=1e-8):
+            misaligned_dates.append((current_date, implied_diff, actual_diff))
 
         error_diff = float(actual_diff - pred_diff)
         error_level = float(actual_level - predicted_level)
@@ -295,11 +338,11 @@ def rolling_forecast_xgb(
     me_level = float(results["error_level"].mean())
 
     print(f"RMSE (diferencia): {rmse_diff:.4f}")
-    print(f"RMSE (level, {reconstruction} rekonstrukcia): {rmse_level:.4f}")
+    print(f"RMSE (level, onestep rekonstrukcia): {rmse_level:.4f}")
     print(f"MAPE (level, WMAPE): {mape_level:.2f}%")
     print(f"ME (level): {me_level:.4f}")
 
-    if reconstruction == "onestep" and misaligned_dates:
+    if misaligned_dates:
         n_bad = len(misaligned_dates)
         first_example = misaligned_dates[0]
         print(
