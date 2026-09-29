@@ -4,8 +4,74 @@ from sklearn.linear_model import ElasticNet
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from typing import cast
 import warnings
 warnings.filterwarnings("ignore")
+
+import functions_general as fg
+
+def _extract_elasticnet_diagnostics(refit_diagnostics, step_diagnostics):
+    coef_rows, sparsity_rows, hyper_rows = [], [], []
+    for rec in refit_diagnostics:
+        d = rec["forecast_date"]
+        coefs = rec.get("coefficients", {})
+        n_sel = rec.get("n_selected", np.nan)
+        for feat, val in coefs.items():
+            coef_rows.append({"forecast_date": d, "feature": feat, "coef": float(val),
+                               "abs_coef": abs(float(val)), "selected": val != 0.0})
+        sparsity_rows.append({"forecast_date": d, "n_selected": n_sel, "n_total": len(coefs),
+                               "sparsity_ratio": 1 - n_sel / len(coefs) if coefs else np.nan})
+        hyper_rows.append({"forecast_date": d, "alpha": rec.get("alpha", np.nan),
+                            "l1_ratio": rec.get("l1_ratio", np.nan),
+                            "intercept": rec.get("intercept", np.nan),
+                            "l1_penalty_weight": rec.get("alpha", np.nan) * rec.get("l1_ratio", np.nan),
+                            "l2_penalty_weight": rec.get("alpha", np.nan) * (1 - rec.get("l1_ratio", np.nan)),
+                        })
+    return {
+        "coefficients": pd.DataFrame(coef_rows),
+        "sparsity": pd.DataFrame(sparsity_rows).set_index("forecast_date") if sparsity_rows else pd.DataFrame(),
+        "hyperparams": pd.DataFrame(hyper_rows).set_index("forecast_date") if hyper_rows else pd.DataFrame(),
+    }
+
+def _make_elasticnet_fit_fn(cv_splits=5, alphas=None, l1_ratios=None, random_state=24):
+    alphas = alphas if alphas is not None else np.logspace(-3, 1, 20)
+    l1_ratios = l1_ratios if l1_ratios is not None else [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
+
+    def _fit(X_train, y_train, current_date):
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_train)
+        n_splits = min(cv_splits, max(len(X_train) // 10, 2))
+        gs = GridSearchCV(ElasticNet(max_iter=20_000, random_state=random_state),
+                           {"alpha": alphas, "l1_ratio": l1_ratios},
+                           cv=TimeSeriesSplit(n_splits=n_splits),
+                           scoring="neg_mean_squared_error", n_jobs=-1)
+        gs.fit(X_scaled, y_train)
+        best = gs.best_estimator_
+
+        diag = {"coefficients": dict(zip(X_train.columns, best.coef_)),
+                "intercept": float(best.intercept_),
+                "n_selected": int(np.sum(best.coef_ != 0)),
+                "alpha": float(gs.best_params_["alpha"]),
+                "l1_ratio": float(gs.best_params_["l1_ratio"])}
+        return (best, scaler), diag
+    return _fit
+
+
+def _elasticnet_predict_fn(model, X_row, current_date):
+    best, scaler = model
+    return float(np.asarray(best.predict(scaler.transform(X_row))).ravel()[0]), {}
+
+def rolling_forecast_elastic_net(X, y_diff, level_series, initial_train_size,
+                                  refit_every=1, cv_splits=5, alphas=None,
+                                  l1_ratios=None, random_state=24, verbose=True):
+    fit_fn = _make_elasticnet_fit_fn(cv_splits, alphas, l1_ratios, random_state)
+
+    out = fg._rolling_forecast_core(X, y_diff, level_series, initial_train_size,
+                                  fit_fn, _elasticnet_predict_fn, refit_every, verbose=verbose)
+    out["diagnostics"] = _extract_elasticnet_diagnostics(out["refit_diagnostics"], out["step_diagnostics"])
+    return out
+
+
 
 def fit_elastic_net(train_y, train_exog, cv_splits = 5, alphas = None, l1_ratios = None, random_state = 24):
 
@@ -65,76 +131,8 @@ def get_coef(model, feature_names):
     return coefs, n_selected
 
 
-def rolling_elastic_net_old(df_final, y_col, exog_cols, test_size = 24, cv_splits = 5, refit_every = 1, alphas = None, l1_ratios = None, verbose = True, random_state = 24):
 
-    data = df_final[[y_col] + exog_cols].dropna().copy()
-
-    n_total = len(data)
-    train_size = n_total - test_size
-
-    if train_size <= cv_splits + 5:
-        raise ValueError(
-            f"Prilis malo trenovacich pozorovnani ({train_size}) pre {cv_splits}-fold TimeSeriesSplit."
-        )
-
-    predictions = []
-    actuals = []
-    dates = []
-    models = {}
-    coef_rows = []
-
-    current_model = None
-    current_scaler = None
-    current_params = None
-
-    for t in range(test_size):
-        train_end = train_size + t
-        train_y = data[y_col].iloc[:train_end]
-        train_exog = data[exog_cols].iloc[:train_end]
-
-        test_date = data.index[train_end]
-        test_exog_row = data[exog_cols].iloc[[train_end]]
-        actual_value = data[y_col].iloc[train_end]
-
-        need_refit = (current_model is None) or (t % refit_every == 0)
-
-        if need_refit:
-            current_model, current_scaler, current_params, _ = fit_elastic_net(train_y=train_y,
-                                                                               train_exog= train_exog, 
-                                                                               cv_splits=cv_splits,
-                                                                               alphas=alphas,
-                                                                               l1_ratios=l1_ratios,
-                                                                               random_state=random_state,
-                                                                               )
-            if verbose:
-                print(f"  [{test_date.date()}] refit: alpha={current_params['alpha']:.4f}, l1_ratio={current_params['l1_ratio']:.2f}")
-
-        pred_value = predict_elastic_net(current_model, current_scaler, test_exog_row)[0]
-
-        predictions.append(pred_value)
-        actuals.append(actual_value)
-        dates.append(test_date)
-        models[test_date] = (current_model, current_scaler)
-
-        coefs, n_selected = get_coef(current_model, exog_cols)
-        coefs["forecast_date"] = test_date
-        coefs["n_selected"] = n_selected
-        coef_rows.append(coefs)
-
-
-    results_df = pd.DataFrame({
-        "date": dates,
-        "actual_diff": actuals,
-        "predicted_diff": predictions,
-    }).set_index("date")
-
-    coef_history = pd.concat(coef_rows, ignore_index=True)
-
-    return results_df, models, coef_history
-
-from typing import cast
-
-def rolling_forecast_elastic_net(
+def rolling_forecast_elastic_net_old(
     X: pd.DataFrame,
     y_diff: pd.Series,
     level_series: pd.Series | pd.DataFrame,

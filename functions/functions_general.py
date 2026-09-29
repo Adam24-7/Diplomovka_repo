@@ -194,9 +194,9 @@ def forecast_plot(
                     any_plotted = True
 
                 if any_plotted:
+                    current_ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
                     current_ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%y"))
-                    current_ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-                    plt.setp(current_ax.get_xticklabels(), rotation=30, ha="right", fontsize=9)
+                    plt.setp(current_ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
 
                     current_ax.grid(True, linestyle=":", alpha=0.6)
                     current_ax.spines["top"].set_visible(False)

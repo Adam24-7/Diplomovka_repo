@@ -53,9 +53,9 @@ def _xgboost_predict_fn(model, X_row, current_date):
 
 def rolling_forecast_xgboost(X, y_diff, level_series, initial_train_size,
                               refit_every=1, xgb_params=None, param_grid=None,
-                              cv_splits=5, objective="reg:squarederror", verbose=True):
+                              cv_splits=5, random_state = 24, objective="reg:squarederror", verbose=True):
     default_params = {"n_estimators": 300, "max_depth": 3, "learning_rate": 0.05,
-                       "subsample": 0.8, "colsample_bytree": 0.8, "random_state": 42}
+                       "subsample": 0.8, "colsample_bytree": 0.8, "random_state": random_state}
     xgb_params = {**default_params, **(xgb_params or {}), "objective": objective}
     fit_fn = _make_xgboost_fit_fn(xgb_params, param_grid, cv_splits)
 

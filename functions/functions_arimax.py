@@ -4,81 +4,131 @@ import pandas as pd
 import numpy as np
 import pmdarima
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+import warnings
+import functions_general as fg
+from statsmodels.stats.diagnostic import acorr_ljungbox
 
+def _extract_arimax_diagnostics(refit_diagnostics, _step_diagnostics=None):
+    residual_records = []
+    coefficient_records = []
 
+    date_keys = ("date", "refit_date", "forecast_date", "current_date")
 
-def evaluate_forecast_rolling(data_diff, exog, initial_train_size, order,
-                               last_train_value, level_series,
-                               seasonal=False, m=12,
-                               enforce_stationarity=True,
-                               maxiter=50, method="lbfgs"):
+    for entry in refit_diagnostics:
+        if isinstance(entry, tuple) and len(entry) == 2:
+            refit_date, fit_diag = entry
+        elif isinstance(entry, dict):
+            date_key = next((k for k in date_keys if k in entry), None)
+            refit_date = entry.get(date_key) if date_key else None
+            fit_diag = entry
+        else:
+            raise TypeError(
+                f"Neocakavany format prvku v refit_diagnostics: {type(entry)}"
+            )
 
-    records = []
-    models_by_step = {}
-
-    for t in range(initial_train_size, len(data_diff)):
-        train_end = t
-        model = pmdarima.arima.ARIMA(
-            order=order,
-            seasonal=seasonal,
-            maxiter=maxiter,
-            method=method,
-            enforce_stationarity=enforce_stationarity,
-            suppress_warnings=True
-        )
-        model.fit(data_diff.iloc[:train_end], X=exog.iloc[:train_end])
-        models_by_step[data_diff.index[t]] = model
-
-        # Predikcia 1 mesiac dopredu (jednokrokova)
-        forecast_step = model.predict(
-            n_periods=1,
-            X=exog.iloc[[t]]
-        )
-
-        pred_diff = float(np.asarray(forecast_step).ravel()[0])
-        true_diff = float(data_diff.iloc[t])
-        current_date = data_diff.index[t]
-
-        # Rekonstrukcia na uroven (onestep)
-        true_level = level_series.loc[current_date]
-        true_prev_level = level_series.shift(1).loc[current_date]
-        pred_level = pred_diff + true_prev_level
-
-        records.append({
-            "date": current_date,
-            "actual_diff": true_diff,
-            "predicted_diff": pred_diff,
-            "actual_level": true_level,
-            "predicted_level": pred_level,
-            "abs_error_diff": abs(true_diff - pred_diff),
-            "sq_error_diff": (true_diff - pred_diff) ** 2,
-            "abs_error_level": abs(true_level - pred_level),
-            "sq_error_level": (true_level - pred_level) ** 2,
-            "pct_error_level": abs((true_level - pred_level) / true_level) * 100
-                                if true_level != 0 else np.nan,
+        residual_records.append({
+            "forecast_date": refit_date,
+            "aic": fit_diag.get("aic", np.nan),
+            "bic": fit_diag.get("bic", np.nan),
+            "ljung_box_pvalue": fit_diag.get("ljung_box_pvalue", np.nan),
+            "order": fit_diag.get("order"),
         })
 
-    results = pd.DataFrame(records).set_index("date")
+        coef_dict = fit_diag.get("coefficients", {})
+        for param_name, value in coef_dict.items():
+            coefficient_records.append({
+                "forecast_date": refit_date,
+                "parameter": param_name,
+                "value": value,
+            })
 
-    # Rolling a window metriky
+    residual_diagnostics = (
+        pd.DataFrame(residual_records).set_index("forecast_date")
+        if residual_records else pd.DataFrame()
+    )
 
-    
-    # Agregovane metriky
-    rmse_diff = np.sqrt(results["sq_error_diff"].mean())
-    rmse_level = np.sqrt(results["sq_error_level"].mean())
-    mape_level = results["pct_error_level"].mean()
-    results["actual_level"] = pd.to_numeric(results["actual_level"], errors="coerce").astype(float)
-    results["predicted_level"] = pd.to_numeric(results["predicted_level"], errors="coerce").astype(float)
+    coefficients = (
+        pd.DataFrame(coefficient_records).set_index("forecast_date")
+        if coefficient_records else pd.DataFrame()
+    )
 
-    me_level = (results["actual_level"] - results["predicted_level"]).mean()
-    me_level = me_level.mean()
+    return {
+        "coefficients": coefficients,
+        "residual_diagnostics": residual_diagnostics,
+    }
 
-    print(f"RMSE (diferencia): {rmse_diff:.4f}")
-    print(f"RMSE (level, onestep rekonstrukcia): {rmse_level:.4f}")
-    print(f"MAPE (level): {mape_level:.2f}%")
-    print(f"ME (level): {me_level:.4f}")
+def _make_arimax_fit_fn(
+    order,
+    seasonal=False,
+    seasonal_order=None,
+    maxiter=50,
+    method="lbfgs",
+):
+    def _fit(X_train, y_train, _current_date):
+        model_kwargs = {
+            "order": order,
+            "method": method,
+            "maxiter": maxiter,
+            "suppress_warnings": True,
+        }
 
-    return results, models_by_step
+        if seasonal:
+            if seasonal_order is None:
+                raise ValueError(
+                    "Pri seasonal=True zadaj seasonal_order, napr. (1, 0, 1, 12)."
+                )
+            model_kwargs["seasonal_order"] = seasonal_order
+
+        model = pmdarima.arima.ARIMA(**model_kwargs)
+        model.fit(y_train, X=X_train)
+
+        arima_res = model.arima_res_
+
+        aic = float(arima_res.aic)
+        bic = float(arima_res.bic)
+
+        resid = arima_res.resid
+        lb_test = acorr_ljungbox(resid, lags=[10], return_df=True)
+        ljung_box_pvalue = float(lb_test["lb_pvalue"].iloc[0])
+
+        params = arima_res.params
+        coef_dict = params.to_dict()
+
+        fit_diagnostics = {
+            "order": order,
+            "seasonal": seasonal,
+            "seasonal_order": seasonal_order if seasonal else None,
+            "train_size": len(y_train),
+            "aic": aic,
+            "bic": bic,
+            "ljung_box_pvalue": ljung_box_pvalue,
+            "coefficients": coef_dict,
+        }
+
+        return model, fit_diagnostics
+
+    return _fit
+
+def _make_arimax_predict_fn(alpha=0.05):
+    def _predict(model, X_row, current_date):
+        forecast, conf_int = model.predict(n_periods=1, X=X_row, return_conf_int=True, alpha=alpha)
+        pred = float(np.asarray(forecast).ravel()[0])
+        ci = np.asarray(conf_int).reshape(-1, 2)[0]
+        return pred, {"ci_lower": float(ci[0]), "ci_upper": float(ci[1])}
+    return _predict
+
+def rolling_forecast_arimax(X, y_diff, level_series, initial_train_size,
+                             order=(1, 0, 1), refit_every=1, seasonal=False,
+                             seasonal_order=None, alpha=0.05, maxiter=50,
+                             method="lbfgs", verbose=True):
+    fit_fn = _make_arimax_fit_fn(order, seasonal, seasonal_order, maxiter=maxiter, method=method)
+    predict_fn = _make_arimax_predict_fn(alpha)
+
+    out = fg._rolling_forecast_core(X, y_diff, level_series, initial_train_size,
+                                  fit_fn, predict_fn, refit_every, verbose=verbose)
+    out["diagnostics"] = _extract_arimax_diagnostics(out["refit_diagnostics"], out["step_diagnostics"])
+    return out
+
 
 def forward_selection(dataset, notinc):
     BASE_ORDER = (1,0,1)

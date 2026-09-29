@@ -9,3 +9,17 @@ __pycache__/functions_elastic_net.cpython-314.pyc
 __pycache__/functions_general.cpython-314.pyc
 __pycache__/functions_elastic_net.cpython-314.pyc
 __pycache__/functions_xgboost.cpython-314.pyc
+functions/__pycache__/functions_arimax.cpython-314.pyc
+functions/__pycache__/functions_elastic_net.cpython-314.pyc
+functions/__pycache__/functions_general.cpython-314.pyc
+functions/__pycache__/functions_stationarity.cpython-314.pyc
+functions/__pycache__/functions_xgboost.cpython-314.pyc
+models/data/arimax_res
+models/data/arimax_sum
+models/data/elnet_res
+models/data/elnet_sum
+models/data/xgb_res
+models/data/xgb_sum
+models/__init__.py
+other/__init__.py
+other/__pycache__/cred.cpython-314.pyc
