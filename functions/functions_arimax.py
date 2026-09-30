@@ -130,7 +130,7 @@ def rolling_forecast_arimax(X, y_diff, level_series, initial_train_size,
     return out
 
 
-def forward_selection(dataset, notinc):
+def forward_selection_old(dataset, notinc):
     BASE_ORDER = (1,0,1)
     SEAS_ORDER = (0,0,0,12)
 
@@ -182,4 +182,58 @@ def forward_selection(dataset, notinc):
     return selected_cols
 
 
+def forward_selection(dataset_train, target_col):
+    BASE_ORDER = (1, 0, 1)
+    SEAS_ORDER = (0, 0, 0, 12)
+
+    # Odstránenie cieľovej premennej a prípadných konštantných stĺpcov
+    exog_pool = [
+        c for c in dataset_train.columns 
+        if c != target_col and dataset_train[c].nunique() > 1
+    ] 
+
+    selected_cols = []
+    best_bic = np.inf
+
+    print("BIC forward selection:")
+    print("-" * 50)
+
+    while True:
+        remaining = [c for c in exog_pool if c not in selected_cols]
+        if not remaining:
+            break
+
+        candidate_bics = {}
+        for col in remaining:
+            trial_cols = selected_cols + [col]
+            try:
+                m = SARIMAX(
+                    dataset_train[target_col], 
+                    exog=dataset_train[trial_cols],
+                    order=BASE_ORDER,
+                    seasonal_order=SEAS_ORDER,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                ).fit(disp=False)
+                candidate_bics[col] = m.bic
+            except Exception:
+                candidate_bics[col] = np.inf
+
+        # Výber kandidáta, ktorý najviac znížil BIC v tomto kole
+        best_candidate = min(candidate_bics, key=candidate_bics.get)
+        best_candidate_bic = candidate_bics[best_candidate]
+
+        if best_candidate_bic < best_bic:
+            best_bic = best_candidate_bic
+            selected_cols.append(best_candidate)
+            print(f"  + '{best_candidate}'  BIC = {best_bic:.2f}")
+        else:
+            print(f"  Zastavenie — pridanie ďalšej premennej nezlepšuje BIC.")
+            break
+
+    print("-" * 50)
+    print(f"Vybrané premenné: {selected_cols}")
+    print(f"Finálny BIC     : {best_bic:.2f}")
+
+    return selected_cols
 
