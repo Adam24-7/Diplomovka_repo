@@ -182,7 +182,7 @@ def forward_selection_old(dataset, notinc):
     return selected_cols
 
 
-def forward_selection(dataset_train, target_col):
+def forward_selection(dataset_train, target_col, infc = "bic"):
     BASE_ORDER = (1, 0, 1)
     SEAS_ORDER = (0, 0, 0, 12)
 
@@ -193,9 +193,9 @@ def forward_selection(dataset_train, target_col):
     ] 
 
     selected_cols = []
-    best_bic = np.inf
+    best_infc = np.inf
 
-    print("BIC forward selection:")
+    print(f"Forward selection ({infc}):")
     print("-" * 50)
 
     while True:
@@ -203,7 +203,7 @@ def forward_selection(dataset_train, target_col):
         if not remaining:
             break
 
-        candidate_bics = {}
+        candidate_infc = {}
         for col in remaining:
             trial_cols = selected_cols + [col]
             try:
@@ -215,25 +215,31 @@ def forward_selection(dataset_train, target_col):
                     enforce_stationarity=False,
                     enforce_invertibility=False,
                 ).fit(disp=False)
-                candidate_bics[col] = m.bic
+                if infc == "bic":
+                    candidate_infc[col] = m.bic
+                elif infc == "aic":
+                    candidate_infc[col] = m.aic
+                else:
+                    print(f"Neplatný názov informačného kritéria {infc}, použije sa BIC.")
+                    candidate_infc[col] = m.bic
+                        
             except Exception:
-                candidate_bics[col] = np.inf
+                candidate_infc[col] = np.inf
 
-        # Výber kandidáta, ktorý najviac znížil BIC v tomto kole
-        best_candidate = min(candidate_bics, key=candidate_bics.get)
-        best_candidate_bic = candidate_bics[best_candidate]
+        best_candidate = min(candidate_infc, key=lambda k: candidate_infc[k])
+        best_candidate_infc = candidate_infc[best_candidate]
 
-        if best_candidate_bic < best_bic:
-            best_bic = best_candidate_bic
+        if best_candidate_infc < best_infc:
+            best_infc = best_candidate_infc
             selected_cols.append(best_candidate)
-            print(f"  + '{best_candidate}'  BIC = {best_bic:.2f}")
+            print(f"  + '{best_candidate}'  {infc} = {best_infc:.2f}")
         else:
-            print(f"  Zastavenie — pridanie ďalšej premennej nezlepšuje BIC.")
+            print(f"  Zastavenie — pridanie ďalšej premennej nezlepšuje {infc}.")
             break
 
     print("-" * 50)
     print(f"Vybrané premenné: {selected_cols}")
-    print(f"Finálny BIC     : {best_bic:.2f}")
+    print(f"Finálny {infc}     : {best_infc:.2f}")
 
     return selected_cols
 
