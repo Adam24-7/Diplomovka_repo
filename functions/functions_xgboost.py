@@ -1,10 +1,10 @@
-# functions.py
 from __future__ import annotations
 import pandas as pd
 import numpy as np
 from xgboost import XGBRegressor
 from typing import cast
 from sklearn.model_selection import RandomizedSearchCV, GridSearchCV, TimeSeriesSplit
+import warnings
 
 import functions_general as fg
 
@@ -64,7 +64,7 @@ def rolling_forecast_xgboost(X, y_diff, level_series, initial_train_size,
     out["diagnostics"] = _extract_xgboost_diagnostics(out["refit_diagnostics"], out["step_diagnostics"])
     return out
 
-def make_features(data, target, exog_cols, target_lags=(1, 2, 3, 6, 12), exog_lags=(1,)):
+def make_features_old(data, target, exog_cols, target_lags=(1, 2, 3, 6, 12), exog_lags=(1,)):
     feat = pd.DataFrame(index=data.index)
 
     for lag in target_lags:
@@ -82,12 +82,95 @@ def make_features(data, target, exog_cols, target_lags=(1, 2, 3, 6, 12), exog_la
 
     return feat.dropna()
 
-def hyperparameters_tuning(X_train, y_train, random_state = 24, n_splits = 5):
+def make_features(
+    data,
+    target,
+    exog_cols=None,
+    target_lags=(1, 2, 3, 6, 12),
+    exog_lags=(1,),
+    include_trend=True,
+):
+    exog_cols = list(exog_cols) if exog_cols is not None else []
+    target_lags = tuple(target_lags)
+    exog_lags = tuple(exog_lags)
+ 
+    if not isinstance(data.index, pd.DatetimeIndex):
+        raise TypeError("data musí mať DatetimeIndex.")
+ 
+    missing = [c for c in [target] + exog_cols if c not in data.columns]
+    if missing:
+        raise KeyError(f"Chýbajúce stĺpce v data: {missing}")
+ 
+    if not np.all(np.diff(data.index.to_period("M").asi8) == 1):
+        raise ValueError(
+            "Index musí byť mesačný, chronologicky zoradený, bez duplicít a bez chýbajúcich mesiacov."
+        )
+ 
+    if any(int(lag) != lag or lag < 1 for lag in target_lags + exog_lags):
+        raise ValueError("Všetky oneskorenia (lags) musia byť celé čísla >= 1.")
+ 
+    parts = {}
+ 
+    for lag in target_lags:
+        parts[f"{target}_lag{lag}"] = data[target].shift(lag)
+ 
+    for col in exog_cols:
+        for lag in exog_lags:
+            parts[f"{col}_lag{lag}"] = data[col].shift(lag)
+ 
+    month = data.index.month.to_numpy()
+    parts["month_sin"] = np.sin(2 * np.pi * month / 12)
+    parts["month_cos"] = np.cos(2 * np.pi * month / 12)
+ 
+    if include_trend:
+        parts["trend"] = np.arange(len(data))
+ 
+    parts[target] = data[target]
+ 
+    feat = pd.DataFrame(parts, index=data.index)
+ 
+    max_lag = max(target_lags + exog_lags, default=0)
+    feat = feat.dropna()
+    n_dropped = len(data) - len(feat)
+    if n_dropped > max_lag:
+        warnings.warn(
+            f"Odstránených {n_dropped} riadkov, očakávaných najviac {max_lag}. "
+            "Dáta pravdepodobne obsahujú chýbajúce hodnoty."
+        )
+ 
+    return feat
 
-        #tuning hyperparametrov
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+def hyperparameters_tuning(
+    X_train,
+    y_train,
+    random_state=24,
+    n_splits=5,
+    n_iter=60,
+    gap=0,
+    scoring="neg_root_mean_squared_error",
+):
 
-    #random_search
+    if len(X_train) != len(y_train):
+        raise ValueError(
+            f"X_train a y_train majú rozdielnu dĺžku: {len(X_train)} vs {len(y_train)}."
+        )
+    if len(X_train) <= n_splits + gap:
+        raise ValueError(
+            f"Príliš málo pozorovaní ({len(X_train)}) pre n_splits={n_splits} a gap={gap}."
+        )
+    if isinstance(X_train, pd.DataFrame) and not X_train.index.is_monotonic_increasing:
+        raise ValueError("X_train musí byť zoradený chronologicky (index nie je rastúci).")
+    if np.isnan(np.asarray(y_train, dtype=float)).any():
+        raise ValueError("y_train obsahuje NaN hodnoty.")
+
+    tscv = TimeSeriesSplit(n_splits=n_splits, gap=gap)
+
+    base_params = {
+        "random_state": random_state,
+        "n_jobs": 1,
+        "tree_method": "hist",
+    }
+
     random_param_space = {
         "n_estimators": [100, 200, 300, 400, 600],
         "max_depth": [1, 2, 3, 4, 5, 6],
@@ -101,49 +184,49 @@ def hyperparameters_tuning(X_train, y_train, random_state = 24, n_splits = 5):
     }
 
     random_search = RandomizedSearchCV(
-        estimator=XGBRegressor(random_state=random_state),
+        estimator=XGBRegressor(**base_params),
         param_distributions=random_param_space,
-        n_iter=60,
-        scoring="neg_root_mean_squared_error",
+        n_iter=n_iter,
+        scoring=scoring,
         cv=tscv,
         random_state=random_state,
         n_jobs=-1,
+        refit=False,
+        error_score="raise",
         verbose=1,
     )
 
     random_search.fit(X_train, y_train)
-    print("Najlepsie parametre z Random Search:", random_search.best_params_)
-
     best = random_search.best_params_
+    print("Najlepsie parametre z Random Search:", best)
+    print("CV skore (Random Search):", round(random_search.best_score_, 4))
 
-    #grid_search
-    grid_param_space = {
-        "n_estimators": sorted(set([max(50, best["n_estimators"] - 100), best["n_estimators"], best["n_estimators"] + 100])),
-        "max_depth": sorted(set([max(1, best["max_depth"] - 1), best["max_depth"], best["max_depth"] + 1])),
-        "learning_rate": sorted(set([round(best["learning_rate"] * 0.5, 4), best["learning_rate"], round(best["learning_rate"] * 1.5, 4)])),
-        "gamma": sorted(set([max(0, best["gamma"] - 1), best["gamma"], best["gamma"] + 1])),
-        "subsample": [best["subsample"]],
-        "colsample_bytree": [best["colsample_bytree"]],
-        "min_child_weight": [best["min_child_weight"]],
-        "reg_alpha": [best["reg_alpha"]],
-        "reg_lambda": [best["reg_lambda"]],
-    }
+    params_to_refine = ["n_estimators", "max_depth", "learning_rate", "gamma"]
+    grid_param_space = {}
+    for name, values in random_param_space.items():
+        if name in params_to_refine:
+            idx = values.index(best[name])
+            grid_param_space[name] = values[max(0, idx - 1): idx + 2]
+        else:
+            grid_param_space[name] = [best[name]]
 
     grid_search = GridSearchCV(
-        estimator=XGBRegressor(random_state=random_state),
+        estimator=XGBRegressor(**base_params),
         param_grid=grid_param_space,
-        scoring="neg_root_mean_squared_error",
+        scoring=scoring,
         cv=tscv,
         n_jobs=-1,
+        refit=True,
+        error_score="raise",
         verbose=1,
     )
 
     grid_search.fit(X_train, y_train)
     best_params = grid_search.best_params_
     print("Finalne parametre po Grid Search:", best_params)
+    print("CV skore (Grid Search):", round(grid_search.best_score_, 4))
 
     return grid_search, best_params
-
 
 def rolling_forecast_xgb(
     X: pd.DataFrame,
@@ -297,9 +380,6 @@ def rolling_forecast_xgb(
 
     results = pd.DataFrame(records).set_index("date")
 
-    # ------------------------------------------------------------------
-    # Priebezne (rolling) a okno-based metriky
-    # ------------------------------------------------------------------
     results["rolling_rmse_diff"] = np.sqrt(
         results["sq_error_diff"].expanding().mean()
     )
@@ -326,9 +406,6 @@ def rolling_forecast_xgb(
         results["error_level"].rolling(window=6, min_periods=1).mean()
     )
 
-    # ------------------------------------------------------------------
-    # Agregovane metriky
-    # ------------------------------------------------------------------
     rmse_diff = float(np.sqrt(results["sq_error_diff"].mean()))
     rmse_level = float(np.sqrt(results["sq_error_level"].mean()))
 

@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import pmdarima
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 import warnings
 import functions_general as fg
 from statsmodels.stats.diagnostic import acorr_ljungbox
@@ -182,64 +183,102 @@ def forward_selection_old(dataset, notinc):
     return selected_cols
 
 
-def forward_selection(dataset_train, target_col, infc = "bic"):
-    BASE_ORDER = (1, 0, 1)
-    SEAS_ORDER = (0, 0, 0, 12)
-
-    # Odstránenie cieľovej premennej a prípadných konštantných stĺpcov
+def forward_selection(
+    dataset_train,
+    target_col,
+    infc="bic",
+    base_order=(1, 0, 1),
+    seasonal_order=(0, 0, 0, 12),
+    min_improvement=0.0,
+    require_convergence=True,
+    verbose=True,
+):
+    infc = str(infc).lower()
+    if infc not in ("aic", "bic"):
+        raise ValueError(f"Neplatný názov informačného kritéria '{infc}', povolené hodnoty: 'aic', 'bic'.")
+ 
+    if target_col not in dataset_train.columns:
+        raise KeyError(f"Cieľový stĺpec '{target_col}' sa v dátach nenachádza.")
+ 
     exog_pool = [
-        c for c in dataset_train.columns 
+        c for c in dataset_train.select_dtypes(include=["number", "bool"]).columns
         if c != target_col and dataset_train[c].nunique() > 1
-    ] 
-
+    ]
+    if not exog_pool:
+        raise ValueError("Neexistuje žiadna použiteľná exogénna premenná (číselná a nekonštantná).")
+ 
+    cols_with_nan = [c for c in exog_pool if dataset_train[c].isna().any()]
+    if cols_with_nan:
+        raise ValueError(f"Exogénne premenné obsahujú NaN hodnoty: {cols_with_nan}")
+ 
+    endog = dataset_train[target_col]
+    exog_all = dataset_train[exog_pool].astype(float)
+    exog_all = (exog_all - exog_all.mean()) / exog_all.std()
+ 
     selected_cols = []
     best_infc = np.inf
-
-    print(f"Forward selection ({infc}):")
-    print("-" * 50)
-
+ 
+    if verbose:
+        print(f"Forward selection ({infc}):")
+        print("-" * 50)
+ 
     while True:
         remaining = [c for c in exog_pool if c not in selected_cols]
         if not remaining:
             break
-
+ 
         candidate_infc = {}
+        failed_cols = []
         for col in remaining:
             trial_cols = selected_cols + [col]
             try:
-                m = SARIMAX(
-                    dataset_train[target_col], 
-                    exog=dataset_train[trial_cols],
-                    order=BASE_ORDER,
-                    seasonal_order=SEAS_ORDER,
-                    enforce_stationarity=False,
-                    enforce_invertibility=False,
-                ).fit(disp=False)
-                if infc == "bic":
-                    candidate_infc[col] = m.bic
-                elif infc == "aic":
-                    candidate_infc[col] = m.aic
-                else:
-                    print(f"Neplatný názov informačného kritéria {infc}, použije sa BIC.")
-                    candidate_infc[col] = m.bic
-                        
-            except Exception:
-                candidate_infc[col] = np.inf
-
-        best_candidate = min(candidate_infc, key=lambda k: candidate_infc[k])
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", ConvergenceWarning)
+                    m = SARIMAX(
+                        endog,
+                        exog=exog_all[trial_cols],
+                        order=base_order,
+                        seasonal_order=seasonal_order,
+                        enforce_stationarity=False,
+                        enforce_invertibility=False,
+                    ).fit(disp=False)
+ 
+                value = m.bic if infc == "bic" else m.aic
+                converged = (getattr(m, "mle_retvals", None) or {}).get("converged", True)
+                if not np.isfinite(value) or (require_convergence and not converged):
+                    value = np.inf
+            except (np.linalg.LinAlgError, ValueError):
+                value = np.inf
+ 
+            if not np.isfinite(value):
+                failed_cols.append(col)
+            candidate_infc[col] = value
+ 
+        if verbose and failed_cols:
+            print(f"  Zlyhané alebo nekonvergované modely pre: {failed_cols}")
+ 
+        best_candidate = min(candidate_infc, key=candidate_infc.get) # type: ignore
         best_candidate_infc = candidate_infc[best_candidate]
-
-        if best_candidate_infc < best_infc:
+ 
+        if not np.isfinite(best_candidate_infc):
+            if verbose:
+                print("  Zastavenie — všetky kandidátske modely zlyhali.")
+            break
+ 
+        if best_candidate_infc < best_infc - min_improvement:
             best_infc = best_candidate_infc
             selected_cols.append(best_candidate)
-            print(f"  + '{best_candidate}'  {infc} = {best_infc:.2f}")
+            if verbose:
+                print(f"  + '{best_candidate}'  {infc} = {best_infc:.2f}")
         else:
-            print(f"  Zastavenie — pridanie ďalšej premennej nezlepšuje {infc}.")
+            if verbose:
+                print(f"  Zastavenie — pridanie ďalšej premennej nezlepšuje {infc}.")
             break
-
-    print("-" * 50)
-    print(f"Vybrané premenné: {selected_cols}")
-    print(f"Finálny {infc}     : {best_infc:.2f}")
-
+ 
+    if verbose:
+        print("-" * 50)
+        print(f"Vybrané premenné: {selected_cols}")
+        print(f"Finálny {infc}     : {best_infc:.2f}")
+ 
     return selected_cols
 
